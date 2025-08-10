@@ -36,8 +36,6 @@ flowchart TD
         B[GraphQL Server] 
     end
 
-    A <--> B
-
     D[Devices] <--pub/sub--> A
     E[App] <--pub/sub--> B
 ```
