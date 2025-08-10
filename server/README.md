@@ -25,7 +25,7 @@
 ## Installation
 
 ```bash
-uv pip install -r -U pyproject.toml
+uv pip install -U -r pyproject.toml
 ```
 
 ## Usage
