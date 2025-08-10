@@ -100,8 +100,12 @@ class MQTTHandler:
             # Store the message
             messages_store.append(message)
             
-            # Add to queue for subscriptions
-            asyncio.create_task(mqtt_messages_queue.put(message))
+            # Add to queue for subscriptions (non-blocking)
+            try:
+                mqtt_messages_queue.put_nowait(message)
+                print(f"Added message to queue: {message.content}")
+            except asyncio.QueueFull:
+                print("Message queue is full, skipping...")
             
             print(f"Received message from {msg.topic}: {message.content} (sender: {message.sender})")
             
@@ -227,32 +231,79 @@ class Subscription:
     @strawberry.subscription
     async def message_stream(self, topic: Optional[str] = None) -> AsyncGenerator[Message, None]:
         """Subscribe to real-time messages from MQTT topics"""
-        while True:
-            try:
-                # Wait for a new message
-                message = await mqtt_messages_queue.get()
-                
-                # Filter by topic if specified
-                if topic is None or message.topic == topic:
-                    yield message
+        print(f"Starting subscription for topic: {topic}")
+        
+        # Create a separate queue for this subscription
+        local_queue = asyncio.Queue()
+        
+        # Keep track of initial message count to detect new messages
+        initial_count = len(messages_store)
+        
+        try:
+            while True:
+                # Check for new messages in the global store
+                current_count = len(messages_store)
+                if current_count > initial_count:
+                    # Get new messages since last check
+                    new_messages = messages_store[initial_count:]
                     
-            except Exception as e:
-                print(f"Error in message stream: {e}")
-                await asyncio.sleep(1)
+                    for message in new_messages:
+                        # Filter by topic if specified
+                        if topic is None or message.topic == topic:
+                            print(f"Yielding message: {message.content} from topic: {message.topic}")
+                            yield message
+                    
+                    initial_count = current_count
+                
+                # Also try to get messages from the global queue
+                try:
+                    # Non-blocking check for new messages from MQTT
+                    message = mqtt_messages_queue.get_nowait()
+                    
+                    # Filter by topic if specified
+                    if topic is None or message.topic == topic:
+                        print(f"Yielding queued message: {message.content} from topic: {message.topic}")
+                        yield message
+                        
+                except asyncio.QueueEmpty:
+                    # No messages in queue, continue
+                    pass
+                
+                # Small delay to prevent busy waiting
+                await asyncio.sleep(0.1)
+                
+        except asyncio.CancelledError:
+            print("Subscription cancelled")
+            raise
+        except Exception as e:
+            print(f"Error in message stream subscription: {e}")
+            # Continue the subscription even if there's an error
+            await asyncio.sleep(1)
     
     @strawberry.subscription
     async def topic_activity(self) -> AsyncGenerator[str, None]:
         """Subscribe to topic activity notifications"""
         last_count = len(set(msg.topic for msg in messages_store))
+        print("Starting topic activity subscription")
         
-        while True:
-            await asyncio.sleep(2)  # Check every 2 seconds
-            current_topics = set(msg.topic for msg in messages_store)
-            current_count = len(current_topics)
-            
-            if current_count != last_count:
-                yield f"Topic count changed: {current_count} active topics"
-                last_count = current_count
+        try:
+            while True:
+                await asyncio.sleep(2)  # Check every 2 seconds
+                current_topics = set(msg.topic for msg in messages_store)
+                current_count = len(current_topics)
+                
+                if current_count != last_count:
+                    activity_message = f"Topic count changed: {current_count} active topics"
+                    print(f"Yielding activity: {activity_message}")
+                    yield activity_message
+                    last_count = current_count
+                    
+        except asyncio.CancelledError:
+            print("Topic activity subscription cancelled")
+            raise
+        except Exception as e:
+            print(f"Error in topic activity subscription: {e}")
+            await asyncio.sleep(1)
 
 
 # Lifespan event handler
