@@ -32,8 +32,8 @@
 flowchart TD
 
     subgraph Server
-        A[MQTT]
-        B[GraphQL] 
+        A[MQTT Broker]
+        B[GraphQL Server] 
     end
 
     D[Devices] <--pub/sub--> A
