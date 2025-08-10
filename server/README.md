@@ -1,5 +1,4 @@
-# MQTT GraphQL Server
-
+# GraphQL MQTT Server
 
 ## Features
 
