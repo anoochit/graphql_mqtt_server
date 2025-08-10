@@ -22,6 +22,20 @@
 - Subscribes to topics with wildcard support
 - Handles real-time message processing
 
+## Diagrame
+
+```mermaid
+flowchart TD
+
+    subgraph Server
+        A[MQTT]
+        B[GraphQL] 
+    end
+
+    D[Devices] <--pub/sub--> A
+    E[App] <--pub/sub--> B
+```
+
 ## Installation
 
 ```bash
