@@ -25,8 +25,16 @@ class Message:
     sender: Optional[str] = None
 
 
+@strawberry.type
+class TopicInfo:
+    name: str
+    message_count: int
+    last_message_time: Optional[datetime] = None
+    is_subscribed: bool = False
+
+
 @strawberry.input
-class MessageInput:
+class SendToTopicInput:
     topic: str
     content: str
     sender: Optional[str] = None
@@ -34,7 +42,7 @@ class MessageInput:
 
 # In-memory storage (replace with database in production)
 messages_store: List[Message] = []
-mqtt_messages_queue = asyncio.Queue()
+mqtt_messages_queue = asyncio.Queue(maxsize=1000)  # Increase queue size
 
 
 # MQTT Client Setup
@@ -115,7 +123,7 @@ class MQTTHandler:
     def on_disconnect(self, client, userdata, flags, reason_code, properties):
         print(f"Disconnected from MQTT broker with result code {reason_code}")
     
-    def connect_to_broker(self, host="localhost", port=1883):
+    def connect_to_broker(self, host="mosquitto", port=1883):
         try:
             self.client.connect(host, port, 60)
             self.client.loop_start()
@@ -131,6 +139,14 @@ class MQTTHandler:
             self.client.subscribe(topic)
             print(f"Subscribed to topic: {topic}")
     
+    def unsubscribe_from_topic(self, topic: str):
+        with self._topics_lock:
+            self.subscribed_topics.discard(topic)
+        
+        if self.client.is_connected():
+            self.client.unsubscribe(topic)
+            print(f"Unsubscribed from topic: {topic}")
+    
     def publish_message(self, topic: str, message: str):
         try:
             result = self.client.publish(topic, message)
@@ -143,160 +159,269 @@ class MQTTHandler:
         except Exception as e:
             print(f"Error publishing message: {e}")
             return False
+    
+    def get_subscribed_topics(self):
+        with self._topics_lock:
+            return list(self.subscribed_topics)
 
 
 # Initialize MQTT handler
 mqtt_handler = MQTTHandler()
 
 
-# GraphQL Schema
+# GraphQL Schema - Refactored with topic-focused operations
 @strawberry.type
 class Query:
     @strawberry.field
-    def messages(self, topic: Optional[str] = None, limit: int = 50) -> List[Message]:
-        """Get messages, optionally filtered by topic"""
-        filtered_messages = messages_store
-        
-        if topic:
-            filtered_messages = [msg for msg in messages_store if msg.topic == topic]
-        
-        # Return the most recent messages
-        return sorted(filtered_messages, key=lambda x: x.timestamp, reverse=True)[:limit]
+    def query_topic(self, topic: str, limit: int = 50) -> List[Message]:
+        """Query messages from a specific topic"""
+        print(f"Querying topic: {topic}, Total messages in store: {len(messages_store)}")
+        topic_messages = [msg for msg in messages_store if msg.topic == topic]
+        print(f"Found {len(topic_messages)} messages for topic: {topic}")
+        return sorted(topic_messages, key=lambda x: x.timestamp, reverse=True)[:limit]
     
     @strawberry.field
-    def topics(self) -> List[str]:
-        """Get all available topics"""
-        return list(set(msg.topic for msg in messages_store))
+    def query_all_topics(self) -> List[TopicInfo]:
+        """Get information about all available topics"""
+        print(f"Total messages in store: {len(messages_store)}")
+        topic_stats = {}
+        
+        # Gather statistics for each topic
+        for msg in messages_store:
+            if msg.topic not in topic_stats:
+                topic_stats[msg.topic] = {
+                    'count': 1,
+                    'last_time': msg.timestamp
+                }
+            else:
+                topic_stats[msg.topic]['count'] += 1
+                if msg.timestamp > topic_stats[msg.topic]['last_time']:
+                    topic_stats[msg.topic]['last_time'] = msg.timestamp
+        
+        # Get subscribed topics
+        subscribed_topics = set(mqtt_handler.get_subscribed_topics())
+        
+        # Create TopicInfo objects
+        topic_infos = []
+        for topic_name, stats in topic_stats.items():
+            topic_infos.append(TopicInfo(
+                name=topic_name,
+                message_count=stats['count'],
+                last_message_time=stats['last_time'],
+                is_subscribed=topic_name in subscribed_topics
+            ))
+        
+        print(f"Found {len(topic_infos)} topics: {[t.name for t in topic_infos]}")
+        return sorted(topic_infos, key=lambda x: x.last_message_time or datetime.min, reverse=True)
     
     @strawberry.field
-    def message_count(self, topic: Optional[str] = None) -> int:
-        """Get message count, optionally for a specific topic"""
-        if topic:
-            return len([msg for msg in messages_store if msg.topic == topic])
-        return len(messages_store)
+    def query_subscribed_topics(self) -> List[str]:
+        """Get all currently subscribed MQTT topics"""
+        return mqtt_handler.get_subscribed_topics()
 
 
 @strawberry.type
 class Mutation:
     @strawberry.mutation
-    def send_message(self, message_input: MessageInput) -> Message:
-        """Send a message to an MQTT topic"""
+    def send_to_topic(self, input: SendToTopicInput) -> Message:
+        """Send a message to a specific MQTT topic"""
+        print(f"Sending message to topic: {input.topic}")
+        
         # Create message payload with metadata
         message_payload = {
-            "content": message_input.content,
-            "sender": message_input.sender or "graphql_client",
+            "content": input.content,
+            "sender": input.sender or "graphql_client",
             "id": str(uuid.uuid4()),
             "timestamp": datetime.now().isoformat()
         }
         
         # Publish to MQTT (the message will be handled by on_message callback)
         success = mqtt_handler.publish_message(
-            message_input.topic, 
+            input.topic, 
             json.dumps(message_payload)
         )
         
         if success:
-            # Return the message object (actual storage happens in on_message)
-            return Message(
+            print(f"Message successfully sent to topic: {input.topic}")
+            # Create the message object
+            message = Message(
                 id=message_payload["id"],
-                topic=message_input.topic,
-                content=message_input.content,
+                topic=input.topic,
+                content=input.content,
                 timestamp=datetime.fromisoformat(message_payload["timestamp"]),
                 sender=message_payload["sender"]
             )
+            
+            # Also store locally in case MQTT callback doesn't work
+            messages_store.append(message)
+            
+            # Add to queue for subscriptions
+            try:
+                mqtt_messages_queue.put_nowait(message)
+            except asyncio.QueueFull:
+                print("Queue full when adding sent message")
+            
+            return message
         else:
-            raise Exception("Failed to publish message to MQTT topic")
+            raise Exception(f"Failed to send message to topic: {input.topic}")
     
     @strawberry.mutation
-    def subscribe_to_mqtt_topic(self, topic: str) -> str:
-        """Subscribe to an MQTT topic"""
+    def subscribe_to_topic(self, topic: str) -> str:
+        """Subscribe to an MQTT topic for real-time messages"""
         mqtt_handler.subscribe_to_topic(topic)
-        return f"Subscribed to topic: {topic}"
+        return f"Successfully subscribed to topic: {topic}"
     
     @strawberry.mutation
-    def clear_messages(self, topic: Optional[str] = None) -> str:
-        """Clear messages, optionally for a specific topic"""
+    def unsubscribe_from_topic(self, topic: str) -> str:
+        """Unsubscribe from an MQTT topic"""
+        mqtt_handler.unsubscribe_from_topic(topic)
+        return f"Successfully unsubscribed from topic: {topic}"
+    
+    @strawberry.mutation
+    def clear_topic_messages(self, topic: str) -> str:
+        """Clear all messages from a specific topic"""
+        global messages_store
+        initial_count = len(messages_store)
+        messages_store = [msg for msg in messages_store if msg.topic != topic]
+        cleared_count = initial_count - len(messages_store)
+        return f"Cleared {cleared_count} messages from topic: {topic}"
+    
+    @strawberry.mutation
+    def clear_all_messages(self) -> str:
+        """Clear all messages from all topics"""
+        global messages_store
+        cleared_count = len(messages_store)
+        messages_store.clear()
+        return f"Cleared {cleared_count} messages from all topics"
+    
+    @strawberry.mutation
+    def create_test_data(self) -> str:
+        """Create some test messages for testing purposes"""
         global messages_store
         
-        if topic:
-            messages_store = [msg for msg in messages_store if msg.topic != topic]
-            return f"Cleared messages for topic: {topic}"
-        else:
-            messages_store.clear()
-            return "Cleared all messages"
+        test_messages = [
+            Message(
+                id=str(uuid.uuid4()),
+                topic="test/messages",
+                content="Hello from test topic",
+                timestamp=datetime.now(),
+                sender="test_user"
+            ),
+            Message(
+                id=str(uuid.uuid4()),
+                topic="sensors/temperature",
+                content="25.5°C",
+                timestamp=datetime.now(),
+                sender="sensor_01"
+            ),
+            Message(
+                id=str(uuid.uuid4()),
+                topic="alerts/system",
+                content="System online",
+                timestamp=datetime.now(),
+                sender="system"
+            )
+        ]
+        
+        messages_store.extend(test_messages)
+        
+        # Also add to queue for subscriptions
+        for message in test_messages:
+            try:
+                mqtt_messages_queue.put_nowait(message)
+            except asyncio.QueueFull:
+                print("Queue full when adding test message")
+        
+        return f"Created {len(test_messages)} test messages"
 
 
 @strawberry.type
 class Subscription:
     @strawberry.subscription
-    async def message_stream(self, topic: Optional[str] = None) -> AsyncGenerator[Message, None]:
-        """Subscribe to real-time messages from MQTT topics"""
+    async def subscribe_topic_messages(self, topic: str) -> AsyncGenerator[Message, None]:
+        """Subscribe to real-time messages from a specific MQTT topic"""
         print(f"Starting subscription for topic: {topic}")
-        
-        # Create a separate queue for this subscription
-        local_queue = asyncio.Queue()
-        
-        # Keep track of initial message count to detect new messages
-        initial_count = len(messages_store)
         
         try:
             while True:
-                # Check for new messages in the global store
-                current_count = len(messages_store)
-                if current_count > initial_count:
-                    # Get new messages since last check
-                    new_messages = messages_store[initial_count:]
-                    
-                    for message in new_messages:
-                        # Filter by topic if specified
-                        if topic is None or message.topic == topic:
-                            print(f"Yielding message: {message.content} from topic: {message.topic}")
-                            yield message
-                    
-                    initial_count = current_count
-                
-                # Also try to get messages from the global queue
                 try:
-                    # Non-blocking check for new messages from MQTT
-                    message = mqtt_messages_queue.get_nowait()
+                    # Wait for messages from the global queue with a timeout
+                    message = await asyncio.wait_for(mqtt_messages_queue.get(), timeout=1.0)
                     
-                    # Filter by topic if specified
-                    if topic is None or message.topic == topic:
-                        print(f"Yielding queued message: {message.content} from topic: {message.topic}")
+                    # Only yield messages from the specified topic
+                    if message.topic == topic:
+                        print(f"Yielding message: {message.content} from topic: {message.topic}")
                         yield message
-                        
+                    else:
+                        # Put the message back if it's not for this topic
+                        try:
+                            mqtt_messages_queue.put_nowait(message)
+                        except asyncio.QueueFull:
+                            print("Queue full, dropping message for other topic")
+                            
+                except asyncio.TimeoutError:
+                    # No message received within timeout, continue listening
+                    continue
+                    
                 except asyncio.QueueEmpty:
-                    # No messages in queue, continue
-                    pass
-                
-                # Small delay to prevent busy waiting
-                await asyncio.sleep(0.1)
+                    # No messages in queue, wait a bit
+                    await asyncio.sleep(0.1)
                 
         except asyncio.CancelledError:
-            print("Subscription cancelled")
+            print(f"Subscription cancelled for topic: {topic}")
             raise
         except Exception as e:
-            print(f"Error in message stream subscription: {e}")
-            # Continue the subscription even if there's an error
+            print(f"Error in topic subscription for {topic}: {e}")
             await asyncio.sleep(1)
     
     @strawberry.subscription
-    async def topic_activity(self) -> AsyncGenerator[str, None]:
-        """Subscribe to topic activity notifications"""
-        last_count = len(set(msg.topic for msg in messages_store))
+    async def subscribe_all_topic_messages(self) -> AsyncGenerator[Message, None]:
+        """Subscribe to real-time messages from all MQTT topics"""
+        print("Starting subscription for all topics")
+        
+        try:
+            while True:
+                try:
+                    # Wait for messages from the global queue with a timeout
+                    message = await asyncio.wait_for(mqtt_messages_queue.get(), timeout=1.0)
+                    print(f"Yielding message: {message.content} from topic: {message.topic}")
+                    yield message
+                        
+                except asyncio.TimeoutError:
+                    # No message received within timeout, continue listening
+                    continue
+                    
+                except asyncio.QueueEmpty:
+                    # No messages in queue, wait a bit
+                    await asyncio.sleep(0.1)
+                
+        except asyncio.CancelledError:
+            print("Subscription cancelled for all topics")
+            raise
+        except Exception as e:
+            print(f"Error in all topics subscription: {e}")
+            await asyncio.sleep(1)
+    
+    @strawberry.subscription
+    async def subscribe_topic_activity(self) -> AsyncGenerator[str, None]:
+        """Subscribe to notifications about topic activity changes"""
+        last_topics = set()
         print("Starting topic activity subscription")
         
         try:
             while True:
                 await asyncio.sleep(2)  # Check every 2 seconds
                 current_topics = set(msg.topic for msg in messages_store)
-                current_count = len(current_topics)
                 
-                if current_count != last_count:
-                    activity_message = f"Topic count changed: {current_count} active topics"
-                    print(f"Yielding activity: {activity_message}")
-                    yield activity_message
-                    last_count = current_count
+                # Check for new topics
+                new_topics = current_topics - last_topics
+                if new_topics:
+                    for topic in new_topics:
+                        activity_message = f"New topic detected: {topic}"
+                        print(f"Yielding activity: {activity_message}")
+                        yield activity_message
+                
+                last_topics = current_topics
                     
         except asyncio.CancelledError:
             print("Topic activity subscription cancelled")
@@ -361,14 +486,14 @@ app.include_router(graphql_app, prefix="/graphql")
 @app.get("/")
 async def root():
     """Root endpoint with basic info"""
-    with mqtt_handler._topics_lock:
-        subscribed_topics = list(mqtt_handler.subscribed_topics)
+    subscribed_topics = mqtt_handler.get_subscribed_topics()
     
     return {
         "message": "GraphQL MQTT Server",
         "graphql_endpoint": "/graphql",
-        "mqtt_topics": subscribed_topics,
-        "message_count": len(messages_store)
+        "mqtt_subscribed_topics": subscribed_topics,
+        "total_message_count": len(messages_store),
+        "available_topics": list(set(msg.topic for msg in messages_store))
     }
 
 
