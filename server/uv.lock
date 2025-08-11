@@ -219,6 +219,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "fastapi" },
     { name = "paho-mqtt" },
+    { name = "python-dotenv" },
     { name = "strawberry-graphql" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -227,6 +228,7 @@ dependencies = [
 requires-dist = [
     { name = "fastapi", specifier = ">=0.116.1" },
     { name = "paho-mqtt", specifier = ">=2.1.0" },
+    { name = "python-dotenv", specifier = ">=1.1.1" },
     { name = "strawberry-graphql", specifier = ">=0.278.1" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.35.0" },
 ]

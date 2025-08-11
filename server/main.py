@@ -6,6 +6,7 @@ import uuid
 from contextlib import asynccontextmanager
 import threading
 
+from dotenv import load_dotenv
 import strawberry
 from strawberry.fastapi import GraphQLRouter
 from strawberry.subscriptions import GRAPHQL_TRANSPORT_WS_PROTOCOL, GRAPHQL_WS_PROTOCOL
@@ -13,7 +14,9 @@ from fastapi import FastAPI
 import paho.mqtt.client as mqtt
 from paho.mqtt.enums import CallbackAPIVersion
 import uvicorn
+import os
 
+load_dotenv()
 
 # Data models
 @strawberry.type
@@ -436,9 +439,13 @@ class Subscription:
 async def lifespan(app: FastAPI):
     # Startup
     print("Starting up GraphQL MQTT Server...")
-    
+
+    mqtt_host= os.environ['MQTT_HOST']
+    mqtt_port=os.environ['MQTT_PORT']
+        
     # Connect to MQTT broker (change host/port as needed)
-    mqtt_handler.connect_to_broker(host="localhost", port=1883)
+    # mqtt_handler.connect_to_broker(host="localhost", port=1883)
+    mqtt_handler.connect_to_broker(host=mqtt_host, port=mqtt_port)
     
     # Subscribe to some default topics for testing
     mqtt_handler.subscribe_to_topic("test/messages")
